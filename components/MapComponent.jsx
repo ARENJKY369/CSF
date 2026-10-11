@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import L from 'leaflet';
 import {
   MapContainer,
@@ -13,11 +13,19 @@ import {
   useMapEvents,
 } from 'react-leaflet';
 import { LIGHT_HUBS } from '../lib/astronomy';
+import { buildProviderChain } from '../lib/tileProviders';
+import { probeTileProvider } from '../lib/tileProbeRunner';
 
-const DARK_TILE_URL =
-  'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
-const TILE_ATTRIBUTION =
-  '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>';
+// Matches .leaflet-container's background so failed tiles degrade to dark
+// squares instead of broken-image icons. Purely local — no external request.
+const ERROR_TILE_URL =
+  "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='256' height='256'%3E%3Crect width='256' height='256' fill='%230a1116'/%3E%3C/svg%3E";
+
+// Advance to the next provider after this many tile request failures…
+const TILE_ERROR_THRESHOLD = 5;
+// …counted within this sliding window, so a one-off network blip doesn't
+// downgrade the basemap.
+const TILE_ERROR_WINDOW_MS = 20000;
 
 function MapClickHandler({ onLocationSelect }) {
   useMapEvents({
@@ -37,6 +45,38 @@ function MapRecenter({ center, zoom }) {
     if (!Number.isFinite(center?.[0]) || !Number.isFinite(center?.[1])) return;
     map.setView(center, zoom, { animate: true, duration: 0.7 });
   }, [map, center?.[0], center?.[1], zoom]);
+  return null;
+}
+
+/**
+ * Verifies the ACTIVE provider's tiles by pixel content, once per activation.
+ * A provider can answer HTTP 200 with an "API KEY REQUIRED" watermark image
+ * (keyless CARTO has done exactly this since Aug 2026), so status codes are
+ * not enough — see lib/tileProbe.js for the heuristics. Inconclusive results
+ * (offline, CORS-blocked canvas) keep the provider; hard failures are handled
+ * by the tileerror counter instead. The probe never throws into React.
+ */
+function BasemapProbe({ provider, onProviderFail }) {
+  useEffect(() => {
+    let cancelled = false;
+    probeTileProvider(provider)
+      .then((result) => {
+        if (cancelled) return;
+        if (result.status === 'fail') {
+          onProviderFail(provider.id, result.reason, result.detail);
+        } else {
+          console.info(
+            `[basemap] tile probe for "${provider.name}": ${result.status}${result.detail ? ` — ${result.detail}` : ''}`,
+          );
+        }
+      })
+      .catch((error) => {
+        console.warn(`[basemap] tile probe for "${provider.name}" errored (ignored):`, error);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [provider, onProviderFail]);
   return null;
 }
 
@@ -135,6 +175,74 @@ export default function MapComponent({
     [],
   );
 
+  // ── Basemap provider chain (keyless by default; see lib/tileProviders.js) ──
+  const { chain: providers, warnings } = useMemo(() => buildProviderChain(), []);
+  const [providerIndex, setProviderIndex] = useState(0);
+  const providerIndexRef = useRef(0);
+  const failedProvidersRef = useRef(new Set());
+  const tileErrorBucketsRef = useRef({});
+  const warningsLoggedRef = useRef(false);
+
+  useEffect(() => {
+    if (warningsLoggedRef.current) return;
+    warningsLoggedRef.current = true;
+    for (const warning of warnings) console.warn(`[basemap] ${warning}`);
+    console.info(
+      `[basemap] provider chain: ${providers.map((provider) => provider.name).join(' → ')}`,
+    );
+  }, [providers, warnings]);
+
+  const activeProvider = providers[Math.min(providerIndex, providers.length - 1)];
+
+  /**
+   * Marks a provider as failed and steps ONCE to the next in the chain.
+   * Monotonic and idempotent: stale events from removed layers are ignored,
+   * a provider is never retried, and the chain end is final — the map stays
+   * interactive (pin, click, controls, glow) even without basemap tiles.
+   */
+  const handleProviderFail = useCallback(
+    (providerId, reason, detail = '') => {
+      if (failedProvidersRef.current.has(providerId)) return;
+      const index = providerIndexRef.current;
+      const current = providers[index];
+      if (!current || current.id !== providerId) return;
+      failedProvidersRef.current.add(providerId);
+      const next = providers[index + 1];
+      if (next) {
+        console.warn(
+          `[basemap] "${current.name}" failed (${reason}); switching to "${next.name}". ${detail}`.trimEnd(),
+        );
+        providerIndexRef.current = index + 1;
+        setProviderIndex(index + 1);
+      } else {
+        console.warn(
+          `[basemap] "${current.name}" failed (${reason}) and no fallback providers remain; the map stays interactive without basemap tiles. ${detail}`.trimEnd(),
+        );
+      }
+    },
+    [providers],
+  );
+
+  const handleTileError = useCallback(
+    (providerId) => {
+      if (failedProvidersRef.current.has(providerId)) return;
+      const now = Date.now();
+      let bucket = tileErrorBucketsRef.current[providerId];
+      if (!bucket || now - bucket.windowStart > TILE_ERROR_WINDOW_MS) {
+        bucket = { count: 0, windowStart: now };
+        tileErrorBucketsRef.current[providerId] = bucket;
+      }
+      bucket.count += 1;
+      if (bucket.count >= TILE_ERROR_THRESHOLD) {
+        handleProviderFail(
+          providerId,
+          `${bucket.count} tile requests failed within ${Math.round((now - bucket.windowStart) / 1000)}s`,
+        );
+      }
+    },
+    [handleProviderFail],
+  );
+
   return (
     <div className="dark-map" aria-label="Interactive dark-sky map">
       <MapContainer
@@ -147,13 +255,20 @@ export default function MapComponent({
         preferCanvas
         worldCopyJump
       >
-        <TileLayer
-          attribution={TILE_ATTRIBUTION}
-          url={DARK_TILE_URL}
-          subdomains="abcd"
-          maxZoom={20}
-          tileSize={256}
-        />
+        {activeProvider.layers.map((layer, index) => {
+          const { url, attribution, ...layerOptions } = layer;
+          return (
+            <TileLayer
+              key={`${activeProvider.id}-${index}`}
+              url={url}
+              attribution={attribution}
+              errorTileUrl={ERROR_TILE_URL}
+              eventHandlers={{ tileerror: () => handleTileError(activeProvider.id) }}
+              {...layerOptions}
+            />
+          );
+        })}
+        <BasemapProbe provider={activeProvider} onProviderFail={handleProviderFail} />
         <LightPollutionCanvasLayer enabled={showHeatmap} />
         <Marker position={center} icon={markerIcon} keyboard title="Selected observing site">
           <Popup>
