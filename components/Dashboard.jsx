@@ -537,13 +537,22 @@ function LocationCard({ location, geoStatus, locating }) {
   );
 }
 
-function MapPanel({ location, onLocationSelect, showHeatmap, onToggleHeatmap, weatherStatus }) {
+function MapPanel({
+  location,
+  onLocationSelect,
+  onUserLocate,
+  onLocateError,
+  onLocatingChange,
+  showHeatmap,
+  onToggleHeatmap,
+  weatherStatus,
+}) {
   return (
     <section className="panel map-panel" aria-labelledby="map-panel-title">
       <div className="map-toolbar">
         <div className="map-toolbar-title">
           <div className="map-title-row" id="map-panel-title"><Compass aria-hidden="true" /> DARK-SKY FIELD MAP</div>
-          <div className="map-caption">Click the map to move your observing pin</div>
+          <div className="map-caption">Click the map to pin a site · Layers + Locate in-map</div>
         </div>
         <div className="map-toolbar-actions">
           <span className="map-status"><span className="live-dot" />{weatherStatus === 'ready' || weatherStatus === 'refreshing' ? 'LIVE MODEL' : 'SITE MODEL'}</span>
@@ -566,7 +575,11 @@ function MapPanel({ location, onLocationSelect, showHeatmap, onToggleHeatmap, we
           zoom={location.zoom || 9}
           locationName={location.name}
           onLocationSelect={onLocationSelect}
+          onUserLocate={onUserLocate}
+          onLocateError={onLocateError}
+          onLocatingChange={onLocatingChange}
           showHeatmap={showHeatmap}
+          onToggleHeatmap={onToggleHeatmap}
         />
         <div className="map-overlay-top">
           <span className="map-pin-caption"><MapPin aria-hidden="true" /> OBSERVING PIN</span>
@@ -1014,7 +1027,36 @@ export default function Dashboard() {
     setSearchText('');
   }, [setChosenLocation]);
 
+  /**
+   * The map's own "Locate me" button resolved a high-accuracy fix: adopt it as
+   * the observing site at street level and force an immediate Open-Meteo
+   * refetch. The token bump matters when the user re-locates from the same
+   * spot — identical coordinates would otherwise leave the effect untouched —
+   * so the stargazing score always recalculates for the fresh fix.
+   */
+  const chooseLocatedSite = useCallback(({ lat, lng }) => {
+    const nextLat = Number(Number(lat).toFixed(6));
+    const nextLng = Number(Number(lng).toFixed(6));
+    if (!Number.isFinite(nextLat) || !Number.isFinite(nextLng)) return;
+    if (Math.abs(nextLat) > 90 || Math.abs(nextLng) > 180) return;
+    manualLocationRef.current = false;
+    setLocation({ lat: nextLat, lng: nextLng, name: 'Current device location', zoom: 15 });
+    setWeatherError('');
+    setSearchResults([]);
+    setGeoStatus('located');
+    setRefreshToken((value) => value + 1);
+  }, []);
+
+  /** Geolocation failures raised inside the map box (Leaflet error codes). */
+  const handleMapLocateError = useCallback((code) => {
+    setLocating(false);
+    setGeoStatus(code === 1 ? 'denied' : 'unavailable');
+  }, []);
+
   const refresh = useCallback(() => setRefreshToken((value) => value + 1), []);
+
+  /** Shared by the toolbar GLOW button and the in-map layer switcher. */
+  const toggleHeatmap = useCallback(() => setShowHeatmap((value) => !value), []);
 
   const handleSearchChange = useCallback((value) => {
     setSearchText(value);
@@ -1090,8 +1132,11 @@ export default function Dashboard() {
             <MapPanel
               location={location}
               onLocationSelect={chooseMapLocation}
+              onUserLocate={chooseLocatedSite}
+              onLocateError={handleMapLocateError}
+              onLocatingChange={setLocating}
               showHeatmap={showHeatmap}
-              onToggleHeatmap={() => setShowHeatmap((value) => !value)}
+              onToggleHeatmap={toggleHeatmap}
               weatherStatus={weatherStatusForLocation}
             />
             <AstroWindowsCard plan={nightPlan} now={clock} timeZone={timezone} />
@@ -1104,7 +1149,7 @@ export default function Dashboard() {
         </div>
 
         <footer className="app-footer">
-          <div className="footer-source"><Satellite aria-hidden="true" /> OPEN-METEO CONDITIONS <span>·</span> SUNCalc TWILIGHT <span>·</span> CARTO / OSM MAP <span>·</span> NOMINATIM SEARCH</div>
+          <div className="footer-source"><Satellite aria-hidden="true" /> OPEN-METEO CONDITIONS <span>·</span> SUNCalc TWILIGHT <span>·</span> GOOGLE / ESRI / OPENTOPO MAP <span>·</span> NASA GIBS CLOUD IR <span>·</span> NOMINATIM SEARCH</div>
           <div className="footer-right">
             <span>LIGHT GLOW IS A PROXIMITY ESTIMATE</span>
             <a href="https://open-meteo.com/en/docs" target="_blank" rel="noreferrer">DATA SOURCES <ArrowUpRight aria-hidden="true" size={10} /></a>
