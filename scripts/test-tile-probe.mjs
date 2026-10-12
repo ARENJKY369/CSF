@@ -96,6 +96,20 @@ function makeWatermarkedTile(seed) {
   });
 }
 
+/**
+ * THIN diagonal watermark (~3% coverage, 64px period) over real geography —
+ * below any sane brightness limit, but perfectly periodic along the diagonal.
+ * This mimics a subtle "API KEY REQUIRED" stamp on an invalid/missing key.
+ */
+function makeThinWatermarkedTile(seed) {
+  const base = makeRealisticDarkTile(seed);
+  return makeTile((x, y) => {
+    if ((x + y) % 64 < 2) return [250, 250, 250];
+    const o = (y * SIZE + x) * 4;
+    return [base[o] * 0.55, base[o + 1] * 0.55, base[o + 2] * 0.55];
+  });
+}
+
 /** Broken provider serving flat gray at every coordinate. */
 function makeBlankTile() {
   return makeTile(() => [40, 40, 40]);
@@ -151,6 +165,33 @@ check(
   'watermark stamped over dark tiles FAILS',
   wmResult.verdict === 'fail' && wmResult.reason === 'watermark-overlay',
   wmResult.reason,
+);
+
+check(
+  'realistic dark tile has low diagonal periodicity',
+  statsA.diagonalRepeatScore < 0.3,
+  `score=${statsA.diagonalRepeatScore}`,
+);
+
+const thinA = makeThinWatermarkedTile(31);
+const thinB = makeThinWatermarkedTile(32);
+const thinStatsA = computeTileStats(thinA, SIZE, SIZE);
+const thinStatsB = computeTileStats(thinB, SIZE, SIZE);
+check(
+  'thin watermark: low bright coverage but strong diagonal repeat',
+  thinStatsA.brightFraction < 0.05 && thinStatsA.diagonalRepeatScore >= 0.45,
+  JSON.stringify({ bright: thinStatsA.brightFraction, repeat: thinStatsA.diagonalRepeatScore }),
+);
+const thinResult = classifyProbeResult({
+  identical: false,
+  statsA: thinStatsA,
+  statsB: thinStatsB,
+  dark: true,
+});
+check(
+  'THIN diagonal watermark FAILS via periodicity',
+  thinResult.verdict === 'fail' && thinResult.reason === 'watermark-overlay',
+  thinResult.reason,
 );
 
 const lightResult = classifyProbeResult({
